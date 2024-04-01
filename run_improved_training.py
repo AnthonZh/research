@@ -192,14 +192,14 @@ class Trainer:
                         self.save_checkpoint(epoch)
                 break
 
-    def sample(self, model,  ts): 
+    def sample(self, model, ts): 
         first_sigma = ts[0]
         x = torch.randn(size = self.sample_shape).to(device=self.gpu_id) * first_sigma
         
         sigma = torch.full((x.shape[0],), first_sigma, dtype=x.dtype, device=self.gpu_id)
         sigma = torch.squeeze(sigma,dim=-1) 
 
-        x = self.model_forward_wrapper(model,x,sigma)
+        x = self.model_forward_wrapper(model, x,sigma)
         for sigma in ts[1:]:
             z = torch.randn_like(x).to(device=self.gpu_id)
             x = x + math.sqrt(sigma**2 - self.sigma_min**2) * z
