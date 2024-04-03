@@ -11,11 +11,14 @@ import os
 import math 
 import numpy as np
 import random
+import matplotlib.pyplot as plt
 from architectures.openai.unet import UNetModel 
 from utils.common_functions import create_output_folders, save_grid, save_log, save_state_dict
 from utils.datasetloader import LDCTLoader
 from datetime import datetime 
 from torch import Tensor
+from skimage.metrics import structural_similarity
+from skimage.metrics import peak_signal_noise_ratio
 
 DEEP_MODEL='deep'
 OPENAI_MODEL='oai'
@@ -30,6 +33,7 @@ class Trainer:
         model_name, 
         model: torch.nn.Module,
         train_data: DataLoader,
+        dataset,
         optimizer: torch.optim.Optimizer,
         gpu_id: int,
         total_training_steps: int,
@@ -43,15 +47,16 @@ class Trainer:
         eta_min = 1e-5,
         upper_mult = 3.55,
         find_unused_parameters = True,
-        anatomical_threshold: float = 128.,
-        anatomical_weight: float = 1.,
-        background_weight: float = 0.25
+        anatomical_threshold: float = 24.,
+        anatomical_weight: float = .95,
+        background_weight: float = 0.05
     ) -> None:
         self.model_name = model_name
         self.gpu_id = gpu_id
         self.upper_mult = upper_mult
         self.model = model.to(gpu_id)
         self.train_data = train_data
+        self.dataset = dataset
         self.optimizer = optimizer 
         self.final_timesteps = final_timesteps
         self.sigma_min = sigma_min
@@ -62,7 +67,7 @@ class Trainer:
         self.model = DDP(self.model, device_ids=[self.gpu_id],find_unused_parameters=find_unused_parameters)
         self.epochs = 0  
         self.world_size = world_size 
-        self.sample_shape = (128,3,32,32)
+        self.sample_shape = (1, 512, 512)
         self.current_training_step = self.gpu_id  
         self.initial_timesteps = initial_timesteps
         self.training_steps_completed = False
@@ -108,6 +113,7 @@ class Trainer:
                 self.model.train()  
 
             x = x.to(self.gpu_id)
+            y = y.to(self.gpu_id)
             
             loss, num_timesteps, next_timesteps, next_sigmas, current_timesteps, current_sigmas= self._run_batch(x, y) 
             
@@ -161,6 +167,8 @@ class Trainer:
         print('train_data len: '+ str(len(self.train_data)))
         self.epochs= math.ceil(self.total_training_steps / (len(self.train_data)*world_size))
  
+        self.show_denoised_image('Pre-Training')
+
         #self.scheduler = CosineAnnealingLR(self.optimizer,   T_max = self.epochs,     eta_min = self.eta_min)  
         for epoch in range(self.epochs):
             if self.training_steps_completed==False:
@@ -181,31 +189,30 @@ class Trainer:
                 save_log(model_name=self.model_name,record=epoch_result)
                 if self.gpu_id == 0: 
                     with torch.no_grad():
-                        self.sample_and_save(current_training_step=self.current_training_step,sample_steps=[2,5]) 
-                        if epoch%10==0:
+                        #self.sample_and_save(current_training_step=self.current_training_step,sample_steps=[2,5]) 
+                        if epoch%5==0:
                             self.save_checkpoint(epoch)
+                            self.show_denoised_image(epoch)
                 
             else:
                 if self.gpu_id == 0 : 
                     with torch.no_grad():
-                        self.sample_and_save(current_training_step=self.current_training_step,sample_steps=[2,5]) 
+                        #self.sample_and_save(current_training_step=self.current_training_step,sample_steps=[2,5]) 
                         self.save_checkpoint(epoch)
+                        self.show_denoised_image(epoch)
                 break
 
-    def sample(self, model, ts): 
-        first_sigma = ts[0]
-        x = torch.randn(size = self.sample_shape).to(device=self.gpu_id) * first_sigma
-        
-        sigma = torch.full((x.shape[0],), first_sigma, dtype=x.dtype, device=self.gpu_id)
-        sigma = torch.squeeze(sigma,dim=-1) 
+    def sample(self, model, x, ts): 
+        sigma = ts[0:1]
+        sigma = torch.full((x.shape[0],), sigma[0], dtype=x.dtype, device=self.gpu_id)
+        x = x.to(device=self.gpu_id)
+        #sigma = torch.squeeze(sigma,dim=-1) 
+        x = self.model_forward_wrapper(model, x, sigma)
 
-        x = self.model_forward_wrapper(model, x,sigma)
         for sigma in ts[1:]:
             z = torch.randn_like(x).to(device=self.gpu_id)
             x = x + math.sqrt(sigma**2 - self.sigma_min**2) * z
-            sigma = torch.full((x.shape[0],1), sigma, dtype=x.dtype, device=self.gpu_id)
-            sigma = torch.squeeze(sigma,dim=-1)
-            x = self.model_forward_wrapper(model,x,sigma) 
+            x = self.model_forward_wrapper(model, x, torch.tensor([sigma])) 
 
         return x
     
@@ -223,6 +230,49 @@ class Trainer:
             
             save_grid(tensor=sample_results,epoch=int(current_training_step),model_name=self.model_name,sample_step=sample_step)
         self.model.train() 
+    
+    def show_denoised_image(self, epoch):
+        self.model.eval()
+
+        ldct, fdct = self.dataset[50]
+        ldct, fdct = ldct.unsqueeze(0), fdct.unsqueeze(0)
+
+        fdct = torch.squeeze(fdct)
+        fdct = fdct.detach().cpu().numpy()
+        ldct_pre_denoised = torch.squeeze(ldct)
+        ldct_pre_denoised = ldct_pre_denoised.detach().cpu().numpy()
+
+        #noisy_SSIM = structural_similarity(fdct, ldct_pre_denoised, data_range=np.max( [math.ceil(ldct_pre_denoised.max() - ldct_pre_denoised.min()), math.ceil(fdct.max() - fdct.min())] ))
+        #noisy_PSNR = peak_signal_noise_ratio(fdct, ldct_pre_denoised, data_range=np.max( [math.ceil(ldct_pre_denoised.max() - ldct_pre_denoised.min()), math.ceil(fdct.max() - fdct.min())] ))
+
+        ldct.to(device=self.gpu_id)
+        ldct = self.multiple_step_denoising(1, ldct)
+
+        ldct = torch.squeeze(ldct)
+        ldct = ldct.detach().cpu().numpy()
+
+        #denoised_SSIM = structural_similarity(fdct, ldct, data_range=np.max( [math.ceil(ldct.max() - ldct.min()), math.ceil(fdct.max() - fdct.min())] ))
+        #denoised_PSNR = peak_signal_noise_ratio(fdct, ldct, data_range=np.max( [math.ceil(ldct.max() - ldct.min()), math.ceil(fdct.max() - fdct.min())] ))
+
+        #print(f'NOISY -- SSIM: {noisy_SSIM}, PSNR: {noisy_PSNR}\nDENOISED -- SSIM: {denoised_SSIM}, PSNR: {denoised_PSNR}')
+        
+        f, ax = plt.subplots(1, 3)
+        ax[0].imshow(ldct_pre_denoised, cmap='gray')
+        ax[0].set_title('LDCT Pre Denoising')
+        ax[1].imshow(ldct, cmap='gray')
+        ax[1].set_title('LDCT Post Denoising')
+        ax[2].imshow(fdct, cmap='gray')
+        ax[2].set_title('FDCT')
+
+        f.tight_layout()
+        
+        f.savefig(f'training_samples/epoch_{epoch}.png', dpi=1200)
+    
+    def multiple_step_denoising(self, sample_steps, x): 
+        sigmas = self.get_sigmas_linear_reverse(sample_steps, self.sigma_min, self.sigma_max) 
+        #print(sigmas)   
+        sample_results = self.sample(model=self.model, x=x, ts=sigmas)
+        return sample_results
 
     def skip_scaling(self, sigma):
         return self.sigma_data**2 / ((sigma - self.sigma_min) ** 2 + self.sigma_data**2)
@@ -234,8 +284,8 @@ class Trainer:
         c_skip = self.skip_scaling(sigma )
         c_out = self.output_scaling(sigma) 
             
-        c_skip = self.pad_dims_like(c_skip, x)
-        c_out = self.pad_dims_like(c_out, x)
+        c_skip = self.pad_dims_like(c_skip, x).to(device=self.gpu_id)
+        c_out = self.pad_dims_like(c_out, x).to(device=self.gpu_id)
         return c_skip  * x + c_out * model(x, sigma)
 
     def loss_fun_improved(self, current_noisy_data, next_noisy_data, condition, current_sigmas, next_sigmas, sigmas, timesteps, num_timesteps):         
@@ -243,12 +293,13 @@ class Trainer:
         with torch.no_grad():
             current_x = self.model_forward_wrapper(self.model,current_noisy_data,current_sigmas)
         
-        #loss_weights = self.pad_dims_like(self.improved_loss_weighting(sigmas)[timesteps], next_x) 
+        loss_weights = self.pad_dims_like(self.improved_loss_weighting(sigmas)[timesteps], next_x) 
 
-        #ph_loss= self.pseudo_huber_loss(next_x, current_x)
-        #loss = (loss_weights* ph_loss).mean()
+        #ph_loss= self.pseudo_huber_anatomical(current_x, next_x, condition)
+        ph_loss = self.psuedo_huber_condition(current_x, next_x, condition)
 
-        loss = self.pseudo_huber_norms(current_x, next_x, condition)
+        #loss = self.pseudo_huber_norms(current_x, next_x, condition)
+        loss = (loss_weights * ph_loss).mean()
 
         return loss
 
@@ -259,26 +310,33 @@ class Trainer:
         c = 0.00054 * math.sqrt(math.prod(input.shape[1:]))
         return torch.sqrt((input - target) ** 2 + c**2) - c 
     
-    def pseudo_huber_norms(self, a, b, y):
-        a_anatomical = torch.where(a > self.anatomical_threshold, a, 0)
-        a_background = torch.where(a <= self.anatomical_threshold, a, 255)
+    def pseudo_huber_anatomical(self, a, b, y):
+        a_anatomical = torch.where(a > self.anatomical_threshold, a, 0).to(device=self.gpu_id)
+        a_background = torch.where(a <= self.anatomical_threshold, a, 0).to(device=self.gpu_id)
 
-        b_anatomical = torch.where(b > self.anatomical_threshold, b, 0)
-        b_background = torch.where(b <= self.anatomical_threshold, b, 255)
+        b_anatomical = torch.where(b > self.anatomical_threshold, b, 0).to(device=self.gpu_id)
+        b_background = torch.where(b <= self.anatomical_threshold, b, 0).to(device=self.gpu_id)
 
-        y_anatomical = torch.where(y > self.anatomical_threshold, y, 0)
-        y_background = torch.where(y <= self.anatomical_threshold, y, 255)
+        y_anatomical = torch.where(y > self.anatomical_threshold, y, 0).to(device=self.gpu_id)
+        y_background = torch.where(y <= self.anatomical_threshold, y, 0).to(device=self.gpu_id)
 
-        a_b_anatomical = self.ph_function(a_anatomical, b_anatomical)
-        a_y_anatomical = self.ph_function(a_anatomical, y_anatomical)
-        b_y_anatomical = self.ph_function(b_anatomical, y_anatomical)
+        a_b_anatomical = self.pseudo_huber_loss(a_anatomical, b_anatomical)
+        a_y_anatomical = self.pseudo_huber_loss(a_anatomical, y_anatomical)
+        b_y_anatomical = self.pseudo_huber_loss(b_anatomical, y_anatomical)
 
-        a_b_background = self.ph_function(a_background, b_background)
-        a_y_background = self.ph_function(a_background, y_background)
-        b_y_background = self.ph_function(b_background, y_background)
+        a_b_background = self.pseudo_huber_loss(a_background, b_background)
+        a_y_background = self.pseudo_huber_loss(a_background, y_background)
+        b_y_background = self.pseudo_huber_loss(b_background, y_background)
 
-        return self.anatomical_weight * (a_b_anatomical + a_y_anatomical + b_y_anatomical) + self.anatomical_weight * (a_b_background + a_y_background + b_y_background)
+        return self.anatomical_weight * ( (a_b_anatomical * 2/3) + ((a_y_anatomical + b_y_anatomical) * 1/3) ) + self.background_weight * ( (a_b_background * 2/3) + ((a_y_background + b_y_background) * 1/3) )
     
+    def psuedo_huber_condition(self, a, b, y):
+        a_b = self.pseudo_huber_loss(a, b)
+        a_y = self.pseudo_huber_loss(a, y)
+        b_y = self.pseudo_huber_loss(b, y)
+
+        return a_b * 2/3 + (a_y + b_y) * 1/3
+
     def ph_function(self, x, y):
         assert x.dim() == y.dim(), "X and Y don't have the same amount of dimensions"
         c = .00054 * math.sqrt( x.dim() - 1 )
@@ -289,9 +347,13 @@ class Trainer:
         return x.view(*x.shape, *((1,) * ndim))
     
     def add_noise(self,x,current_sigmas,next_sigmas):
-        noise = torch.randn_like(x).to(device=self.gpu_id)  
-        current_noisy_data = x + self.pad_dims_like(current_sigmas,x) * noise
-        next_noisy_data = x + self.pad_dims_like(next_sigmas,x)  * noise 
+        #noise = torch.randn_like(x).to(device=self.gpu_id)  
+
+        current_noisy_data = torch.where(x > self.anatomical_threshold, x + current_sigmas * torch.randn(1).item(), self.anatomical_threshold).to(device=self.gpu_id)
+        next_noisy_data = torch.where(x > self.anatomical_threshold, x + next_sigmas * torch.randn(1).item(), self.anatomical_threshold).to(device=self.gpu_id)
+
+        #current_noisy_data = x + self.pad_dims_like(current_sigmas,x) * noise
+        #next_noisy_data = x + self.pad_dims_like(next_sigmas,x)  * noise 
 
         #current_noisy_data = x + current_sigmas[:,:,None,None] * noise
         #next_noisy_data = x + next_sigmas[:,:,None,None]  * noise 
@@ -321,7 +383,6 @@ class Trainer:
         num_timesteps = min(num_timesteps, self.final_timesteps) + 1
 
         return num_timesteps
-    
 
     def karras_boundaries(self, num_timesteps):
         # This will be used to generate the boundaries for the time discretization
@@ -361,12 +422,14 @@ class Trainer:
         return timesteps
 
 def main(world_size):
-    with open("parameters_cm.yaml", 'r') as stream:
+    with open("parameters.yaml", 'r') as stream:
         parameters = yaml.safe_load(stream)
     #print(parameters)
     ddp_setup() 
     batch_size= parameters['batch_size'] // world_size
-    train_data = LDCTDataset(root=parameters['root'], batch_size=batch_size).dataloader 
+    loader = LDCTLoader(root=parameters['root'], batch_size=batch_size)
+    train_data = loader.dataloader 
+    dataset = loader.dataset
     gpu_id = int(os.environ["RANK"])
     if parameters['model_type'] == DEEP_MODEL: 
         model = UNET( img_channels=parameters['img_channels'],  device=gpu_id,groupnorm=parameters['groupnorm'], attention_resolution=parameters['attention_resolutions'], 
@@ -382,7 +445,7 @@ def main(world_size):
     
     optimizer= torch.optim.AdamW(model.parameters(), lr=parameters['lr']) 
     
-    trainer = Trainer(model_name=parameters['model_name'],model=model, train_data=train_data, optimizer=optimizer, gpu_id=gpu_id,rho = parameters['rho'],  
+    trainer = Trainer(model_name=parameters['model_name'],model=model, train_data=train_data, dataset=dataset, optimizer=optimizer, gpu_id=gpu_id,rho = parameters['rho'],  
         find_unused_parameters=parameters['use_flash_attention'],final_timesteps  = parameters['final_timesteps'], 
         initial_timesteps=parameters['initial_timesteps'], total_training_steps=parameters['total_training_steps'], world_size=world_size)
     trainer.train()
