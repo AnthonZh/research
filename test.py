@@ -176,8 +176,8 @@ def main():
     model.to(device=gpu_id)
 
     tester = Tester(model=model, test_root = parameters['test_root'], denoising_steps=1, gpu_id=gpu_id)
-    #tester.test()
-    tester.show_denoised_image()
+    tester.test()
+    #tester.show_denoised_image()
     
     destroy_process_group()
 
